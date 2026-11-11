@@ -1,8 +1,8 @@
 import http from 'http';
 import express from 'express';
 import cors from 'cors';
-import { handleQuery } from './controllers/queryController.js';
-import { login, register } from './controllers/authController.js';
+import { handleQuery } from './controller/queryController.js';
+import { login, register } from './controller/authcontroller.js';
 import { authenticateToken } from './middleware/auth.js';
 import { initWebSocketServer } from './services/websocketService.js';
 import dotenv from 'dotenv'
