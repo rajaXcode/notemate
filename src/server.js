@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import http from 'http';
 import express from 'express';
 import cors from 'cors';
@@ -5,16 +6,18 @@ import { handleQuery } from './controller/queryController.js';
 import { login, register } from './controller/authcontroller.js';
 import { authenticateToken } from './middleware/auth.js';
 import { initWebSocketServer } from './services/websocketService.js';
-import dotenv from 'dotenv'
 import morgan from 'morgan';
 
-dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(morgan('dev'));
 
+//health
+app.get('/', (req, res) => {
+    res.send("APIs running health");
+})
 //auth
 app.post('/api/auth/register', register);
 app.post('/api/auth/login', login);

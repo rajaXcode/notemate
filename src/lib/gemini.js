@@ -2,7 +2,8 @@ import { GoogleGenAI, Type } from '@google/genai';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL_NAME = 'gemini-3.5-flash';
-const EMBEDDING_MODEL = 'text-embedding-004';
+const EMBEDDING_MODEL = 'gemini-embedding-001';
+const EMBEDDING_DIMENSIONS = 768; // must match vector(768) in schema.prisma
 
 export async function generateDynamicNotes(currentNotes, newTranscript) {
     const prompt = `
@@ -33,8 +34,9 @@ export async function generateGeminiEmbedding(text) {
     const response = await ai.models.embedContent({
         model: EMBEDDING_MODEL,
         contents: text,
+        config: { outputDimensionality: EMBEDDING_DIMENSIONS },
     });
-    return response.embedding.values;
+    return response.embeddings[0].values;
 }
 
 export async function segmentAndRouteNotes(masterDocumentText) {
@@ -63,20 +65,10 @@ export async function segmentAndRouteNotes(masterDocumentText) {
 }
 
 export async function* answerQueryWithContextStream(context, question) {
-    const prompt = `
-    You are a helpful teaching assistant. Use ONLY the provided classroom notes to answer the student's question. 
-    If the answer cannot be inferred from the notes, answer based on your knowledge.
-
-    CONTEXT (Classroom Notes):
-    ${context}
-
-    STUDENT QUESTION:
-    ${question}
-  `;
 
     const responseStream = await ai.models.generateContentStream({
         model: MODEL_NAME,
-        contents: prompt,
+        contents: buildAnswerPrompt(context, question),
     });
 
     for await (const chunk of responseStream) {

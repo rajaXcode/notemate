@@ -1,5 +1,5 @@
 import { prisma } from '../lib/prisma.js';
-import { generateGeminiEmbedding, answerQueryWithContext } from '../lib/gemini.js';
+import { generateGeminiEmbedding, answerQueryWithContextStream } from '../lib/gemini.js';
 
 export async function handleQuery(req, res) {
     const { question, notebookId } = req.body;
@@ -26,7 +26,7 @@ export async function handleQuery(req, res) {
         }
 
         const context = matchedChunks.map(c => c.content).join('\n\n---\n\n');
-        const answer = await answerQueryWithContext(context, question);
+        const answer = await answerQueryWithContextStream(context, question);
 
         res.json({ answer, retrievedChunks: matchedChunks.length });
     } catch (error) {

@@ -1,15 +1,20 @@
+import 'dotenv/config';
 import Redis from 'ioredis';
 
-const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const redisUrl = process.env.REDIS_URL;
 
-const isSecure = redisUrl.startsWith('rediss://');
+if (!redisUrl) {
+    console.warn('[Upstash Redis] Warning: REDIS_URL is not set in .env');
+}
 
-export const redis = new Redis(redisUrl, {
-    tls: isSecure ? { rejectUnauthorized: false } : undefined,
-    maxRetriesPerRequest: 3,
+const isUpstash = redisUrl?.includes('upstash.io') || redisUrl?.startsWith('rediss://');
+
+export const redis = new Redis(redisUrl || 'redis://localhost:6379', {
+    tls: isUpstash ? { rejectUnauthorized: false } : undefined,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
     retryStrategy(times) {
-        const delay = Math.min(times * 50, 2000);
-        return delay;
+        return Math.min(times * 100, 3000);
     }
 });
 

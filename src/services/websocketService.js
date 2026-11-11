@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import Redis from 'ioredis';
 import { prisma } from '../lib/prisma.js';
+import { redis } from '../lib/redis.js';
 import { authenticateWs } from '../middleware/auth.js';
 import {
     generateDynamicNotes,
@@ -8,7 +8,8 @@ import {
     generateGeminiEmbedding
 } from '../lib/gemini.js';
 
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+const SARVAM_URL =
+    'wss://api.sarvam.ai/speech-to-text-realtime/ws?language_code=hi-IN&mode=codemix&stream_type=balanced';
 
 export function initWebSocketServer(server) {
     const wss = new WebSocketServer({ noServer: true });
@@ -30,49 +31,93 @@ export function initWebSocketServer(server) {
         const sessionId = `session_${Date.now()}_${user.id}`;
         console.log(`User ${user.id} connected. Session: ${sessionId}`);
 
-        // Connect to Sarvam STT WebSocket
-        const sarvamWs = new WebSocket('wss://api.sarvam.ai/speech-to-text/ws', {
-            headers: { 'Authorization': `Bearer ${process.env.SARVAM_API_KEY}` }
+        const transcriptKey = `transcripts:${sessionId}`;
+        const notesKey = `master_notes:${sessionId}`;
+
+        const sarvamWs = new WebSocket(SARVAM_URL, {
+            headers: { 'Api-Subscription-Key': process.env.SARVAM_API_KEY }
         });
 
-        sarvamWs.on('open', () => {
-            clientWs.on('message', (audioChunk) => {
-                if (sarvamWs.readyState === WebSocket.OPEN) {
-                    sarvamWs.send(audioChunk);
-                }
-            });
-        });
+        sarvamWs.on('error', (err) => console.error('Sarvam WS error:', err.message));
+        clientWs.on('error', (err) => console.error('Client WS error:', err.message));
 
-        sarvamWs.on('message', async (data) => {
-            const response = JSON.parse(data.toString());
-            clientWs.send(JSON.stringify({ type: 'transcript', text: response.text }));
-
-            if (response.is_final && response.text) {
-                await redis.rpush(`transcripts:${sessionId}`, response.text);
+        // Browser sends raw PCM chunks -> Sarvam wants base64 inside a JSON event
+        clientWs.on('message', (audioChunk) => {
+            if (sarvamWs.readyState === WebSocket.OPEN) {
+                sarvamWs.send(JSON.stringify({
+                    event: 'audio_input',
+                    audio: audioChunk.toString('base64')
+                }));
             }
         });
 
-        // 60-second rolling notes update loop
-        const noteInterval = setInterval(async () => {
-            const newTranscripts = await redis.lrange(`transcripts:${sessionId}`, 0, -1);
-            if (newTranscripts.length > 0) {
-                await redis.del(`transcripts:${sessionId}`);
-                const transcriptText = newTranscripts.join(' ');
+        sarvamWs.on('message', (data) => {
+            const msg = JSON.parse(data.toString());
 
-                const currentNotes = (await redis.get(`master_notes:${sessionId}`)) || '';
-                const updatedNotes = await generateDynamicNotes(currentNotes, transcriptText);
+            if (msg.event === 'transcript.partial' || msg.event === 'transcript.final') {
+                const isFinal = msg.event === 'transcript.final';
+                clientWs.send(JSON.stringify({ type: 'transcript', text: msg.text, isFinal }));
 
-                await redis.set(`master_notes:${sessionId}`, updatedNotes);
+                // only final transcripts feed the notes (redis commands stay ordered on one connection)
+                if (isFinal && msg.text) redis.rpush(transcriptKey, msg.text);
+            } else if (msg.event === 'error') {
+                console.error(`Sarvam error (${msg.code}): ${msg.message}`);
+            }
+        });
+
+        // keep Sarvam from closing on inactivity
+        const pingInterval = setInterval(() => {
+            if (sarvamWs.readyState === WebSocket.OPEN) {
+                sarvamWs.send(JSON.stringify({ event: 'ping' }));
+            }
+        }, 15000);
+
+        // Fold pending transcripts into the master notes.
+        // Calls are chained so the 60s tick and the final flush on close never overlap.
+        async function updateNotes() {
+            const newTranscripts = await redis.lrange(transcriptKey, 0, -1);
+            if (newTranscripts.length === 0) return;
+
+            await redis.ltrim(transcriptKey, newTranscripts.length, -1); // remove only what we read
+            const currentNotes = (await redis.get(notesKey)) || '';
+            const updatedNotes = await generateDynamicNotes(currentNotes, newTranscripts.join(' '));
+
+            await redis.set(notesKey, updatedNotes);
+            if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: 'notes_update', payload: updatedNotes }));
             }
-        }, 60000);
+        }
+
+        let chain = Promise.resolve();
+        const enqueueUpdate = () =>
+            (chain = chain.then(updateNotes).catch((err) => console.error('Notes update error:', err)));
+
+        // 60-second rolling notes update loop
+        const noteInterval = setInterval(enqueueUpdate, 60000);
+
+        // Ask Sarvam to finish (so the last utterance's final transcript still arrives), then close
+        function closeSarvam() {
+            return new Promise((resolve) => {
+                if (sarvamWs.readyState === WebSocket.CLOSED) return resolve();
+                sarvamWs.once('close', resolve);
+                setTimeout(resolve, 5000);
+                if (sarvamWs.readyState === WebSocket.OPEN) {
+                    sarvamWs.send(JSON.stringify({ event: 'end' }));
+                } else {
+                    sarvamWs.terminate();
+                }
+            }).then(() => sarvamWs.terminate());
+        }
 
         // Stop recording & post-process notes into Prisma pgvector
         clientWs.on('close', async () => {
-            sarvamWs.close();
             clearInterval(noteInterval);
+            clearInterval(pingInterval);
 
-            const finalDocument = await redis.get(`master_notes:${sessionId}`);
+            await closeSarvam();
+            await enqueueUpdate(); // flush transcripts not yet in the notes
+
+            const finalDocument = await redis.get(notesKey);
             if (finalDocument) {
                 try {
                     const sections = await segmentAndRouteNotes(finalDocument);
@@ -135,7 +180,7 @@ export function initWebSocketServer(server) {
                 } catch (err) {
                     console.error('Error during post-session processing:', err);
                 } finally {
-                    await redis.del(`master_notes:${sessionId}`);
+                    await redis.del(notesKey);
                 }
             }
         });
