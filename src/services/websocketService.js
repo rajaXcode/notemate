@@ -9,7 +9,7 @@ import {
 } from '../lib/gemini.js';
 
 const SARVAM_URL =
-    'wss://api.sarvam.ai/speech-to-text-realtime/ws?language_code=hi-IN&mode=codemix&stream_type=balanced';
+    'wss://api.sarvam.ai/speech-to-text-realtime/ws?language_code=en-IN&mode=codemix&stream_type=balanced';
 
 export function initWebSocketServer(server) {
     const wss = new WebSocketServer({ noServer: true });
@@ -41,48 +41,66 @@ export function initWebSocketServer(server) {
         sarvamWs.on('error', (err) => console.error('Sarvam WS error:', err.message));
         clientWs.on('error', (err) => console.error('Client WS error:', err.message));
 
-        // Browser sends raw PCM chunks -> Sarvam wants base64 inside a JSON event
-        clientWs.on('message', (audioChunk) => {
+        // Accept raw audio buffer chunks and relay as base64 JSON to Sarvam
+        clientWs.on('message', (data) => {
             if (sarvamWs.readyState === WebSocket.OPEN) {
+                const base64Audio = Buffer.isBuffer(data)
+                    ? data.toString('base64')
+                    : Buffer.from(data).toString('base64');
+
                 sarvamWs.send(JSON.stringify({
                     event: 'audio_input',
-                    audio: audioChunk.toString('base64')
+                    audio: base64Audio
                 }));
             }
         });
 
         sarvamWs.on('message', (data) => {
-            const msg = JSON.parse(data.toString());
+            try {
+                const msg = JSON.parse(data.toString());
 
-            if (msg.event === 'transcript.partial' || msg.event === 'transcript.final') {
-                const isFinal = msg.event === 'transcript.final';
-                clientWs.send(JSON.stringify({ type: 'transcript', text: msg.text, isFinal }));
+                if (msg.event === 'transcript.partial' || msg.event === 'transcript.final') {
+                    const isFinal = msg.event === 'transcript.final';
 
-                // only final transcripts feed the notes (redis commands stay ordered on one connection)
-                if (isFinal && msg.text) redis.rpush(transcriptKey, msg.text);
-            } else if (msg.event === 'error') {
-                console.error(`Sarvam error (${msg.code}): ${msg.message}`);
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                        clientWs.send(JSON.stringify({ type: 'transcript', text: msg.text, isFinal }));
+                    }
+
+                    // Only push final transcripts to Redis
+                    if (isFinal && msg.text) {
+                        redis.rpush(transcriptKey, msg.text);
+                    }
+                } else if (msg.event === 'error') {
+                    console.error(`Sarvam API error (${msg.code}): ${msg.message}`);
+                }
+            } catch (err) {
+                console.error('Error parsing Sarvam payload:', err.message);
             }
         });
 
-        // keep Sarvam from closing on inactivity
+        // Prevent connection timeout with keep-alive pings
         const pingInterval = setInterval(() => {
             if (sarvamWs.readyState === WebSocket.OPEN) {
                 sarvamWs.send(JSON.stringify({ event: 'ping' }));
             }
         }, 15000);
 
-        // Fold pending transcripts into the master notes.
-        // Calls are chained so the 60s tick and the final flush on close never overlap.
+        // Atomic transcript read & note batch generation
         async function updateNotes() {
-            const newTranscripts = await redis.lrange(transcriptKey, 0, -1);
+            // Atomic LRANGE + DEL via pipeline to prevent losing concurrent transcripts
+            const pipeline = redis.pipeline();
+            pipeline.lrange(transcriptKey, 0, -1);
+            pipeline.del(transcriptKey);
+            const results = await pipeline.exec();
+
+            const newTranscripts = results?.[0]?.[1] || [];
             if (newTranscripts.length === 0) return;
 
-            await redis.ltrim(transcriptKey, newTranscripts.length, -1); // remove only what we read
             const currentNotes = (await redis.get(notesKey)) || '';
             const updatedNotes = await generateDynamicNotes(currentNotes, newTranscripts.join(' '));
 
             await redis.set(notesKey, updatedNotes);
+
             if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: 'notes_update', payload: updatedNotes }));
             }
@@ -95,12 +113,12 @@ export function initWebSocketServer(server) {
         // 60-second rolling notes update loop
         const noteInterval = setInterval(enqueueUpdate, 60000);
 
-        // Ask Sarvam to finish (so the last utterance's final transcript still arrives), then close
         function closeSarvam() {
             return new Promise((resolve) => {
                 if (sarvamWs.readyState === WebSocket.CLOSED) return resolve();
                 sarvamWs.once('close', resolve);
                 setTimeout(resolve, 5000);
+
                 if (sarvamWs.readyState === WebSocket.OPEN) {
                     sarvamWs.send(JSON.stringify({ event: 'end' }));
                 } else {
@@ -109,17 +127,17 @@ export function initWebSocketServer(server) {
             }).then(() => sarvamWs.terminate());
         }
 
-        // Stop recording & post-process notes into Prisma pgvector
+        // Post-session cleanup and PgVector sync
         clientWs.on('close', async () => {
             clearInterval(noteInterval);
             clearInterval(pingInterval);
 
             await closeSarvam();
-            await enqueueUpdate(); // flush transcripts not yet in the notes
+            await enqueueUpdate(); // Flush final remaining transcripts into notes
 
-            const finalDocument = await redis.get(notesKey);
-            if (finalDocument) {
-                try {
+            try {
+                const finalDocument = await redis.get(notesKey);
+                if (finalDocument) {
                     const sections = await segmentAndRouteNotes(finalDocument);
 
                     for (const section of sections) {
@@ -128,15 +146,15 @@ export function initWebSocketServer(server) {
                         );
                         const vectorString = `[${vectorArray.join(',')}]`;
 
-                        // Query existing notebooks using cosine similarity
+                        // Fixed SQL syntax for PGVector cosine similarity matching
                         const matches = await prisma.$queryRaw`
-              SELECT id, "topicName", 1 - ("topicEmbedding" <=> ${vectorString}::vector) AS similarity
-              FROM "Notebook"
-              WHERE "userId" = ${user.id}
-                AND 1 - ("topicEmbedding" <=> ${vectorString}::vector) > 0.82
-              ORDER BY "topicEmbedding" <=> ${vectorString}::vector
-              LIMIT 1;
-            `;
+                            SELECT id, "topicName", (1 - ("topicEmbedding" <=> ${vectorString}::vector)) AS similarity
+                            FROM "Notebook"
+                            WHERE "userId" = ${user.id}
+                              AND (1 - ("topicEmbedding" <=> ${vectorString}::vector)) > 0.82
+                            ORDER BY "topicEmbedding" <=> ${vectorString}::vector
+                            LIMIT 1;
+                        `;
 
                         let targetNotebookId;
 
@@ -146,16 +164,16 @@ export function initWebSocketServer(server) {
                             const newNotebook = await prisma.notebook.create({
                                 data: {
                                     userId: user.id,
-                                    subject: 'Physics',
+                                    subject: 'General',
                                     topicName: section.topicName,
                                 }
                             });
 
                             await prisma.$executeRaw`
-                UPDATE "Notebook"
-                SET "topicEmbedding" = ${vectorString}::vector
-                WHERE id = ${newNotebook.id};
-              `;
+                                UPDATE "Notebook"
+                                SET "topicEmbedding" = ${vectorString}::vector
+                                WHERE id = ${newNotebook.id};
+                            `;
 
                             targetNotebookId = newNotebook.id;
                         }
@@ -172,16 +190,17 @@ export function initWebSocketServer(server) {
                         });
 
                         await prisma.$executeRaw`
-              UPDATE "NoteChunk"
-              SET embedding = ${chunkVectorString}::vector
-              WHERE id = ${createdChunk.id};
-            `;
+                            UPDATE "NoteChunk"
+                            SET embedding = ${chunkVectorString}::vector
+                            WHERE id = ${createdChunk.id};
+                        `;
                     }
-                } catch (err) {
-                    console.error('Error during post-session processing:', err);
-                } finally {
-                    await redis.del(notesKey);
                 }
+            } catch (err) {
+                console.error('Error during post-session processing:', err);
+            } finally {
+                await redis.del(notesKey);
+                await redis.del(transcriptKey);
             }
         });
     });
